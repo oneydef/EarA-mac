@@ -2,22 +2,73 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   core:
+    timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15]
-        python: ["3.11", "3.13"]
-    runs-on: ${{ matrix.os }}
+        python: ["3.10", "3.13"]
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -e .
       - run: python -m unittest discover -s tests -v
       - run: eara-mac protocol-selftest
 
+  macos-package:
+    name: macOS package and IOBluetooth
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Build wheel and source archive
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Install packaged app with macOS dependencies
+        run: |
+          python -m venv "$RUNNER_TEMP/eara-package"
+          for wheel in dist/*.whl; do
+            "$RUNNER_TEMP/eara-package/bin/python" -m pip install "${wheel}[macos]"
+          done
+          "$RUNNER_TEMP/eara-package/bin/python" -m pip check
+      - name: Verify installed CLI and native framework without Bluetooth hardware
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/eara-package/bin/eara-mac" --version
+          "$RUNNER_TEMP/eara-package/bin/eara-mac" protocol-selftest
+          "$RUNNER_TEMP/eara-package/bin/python" - <<'PY'
+          import IOBluetooth
+          from eara_mac.transport.iobluetooth import MacOSBluetoothTransport
+
+          transport = MacOSBluetoothTransport()
+          assert callable(IOBluetooth.IOBluetoothDevice.pairedDevices)
+          assert callable(IOBluetooth.IOBluetoothDevice.openRFCOMMChannelSync_withChannelID_delegate_)
+          print("IOBluetooth loaded; discovery and RFCOMM bindings available")
+          PY
+      - name: Run tests against installed wheel
+        run: '"$RUNNER_TEMP/eara-package/bin/python" -m unittest discover -s tests -v'
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: eara-mac-python-package
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
